@@ -20,8 +20,19 @@
 //   DEBUG — 10 most recent rows regardless of deadline, so you can check
 //   from the browser whether spotlight_opportunities actually has data
 //   action=featured's filters should be matching.
+//
+// GET /api/spotlight?action=random
+//   -> { ok:true, spotlight: {...} | null }
+//   DEBUG/STOPGAP — random pick from the 20 most recently added rows,
+//   ignoring deadline and category entirely. If this comes back null,
+//   the table itself has zero rows visible to this key; if it comes
+//   back non-null but action=featured doesn't, the deadline/category
+//   filters (or a NULL deadline/created_at column) are the problem.
+//   getFeaturedSpotlight() also falls back to this same random pick as
+//   its 3rd tier, so the card itself won't go empty for this reason —
+//   this action is just for isolating *why* it would have.
 
-import { getFeaturedSpotlight, listRecentSpotlights } from '../lib/spotlightDB.js'
+import { getFeaturedSpotlight, listRecentSpotlights, getRandomSpotlight } from '../lib/spotlightDB.js'
 
 export default async function handler(req, res) {
   // Same cross-origin situation as api/uabroad.js — called straight from
@@ -50,6 +61,11 @@ export default async function handler(req, res) {
     if (action === 'list') {
       const spotlights = await listRecentSpotlights(10)
       return res.status(200).json({ ok: true, spotlights })
+    }
+
+    if (action === 'random') {
+      const spotlight = await getRandomSpotlight()
+      return res.status(200).json({ ok: true, spotlight })
     }
 
     return res.status(400).json({ ok: false, error: `Unrecognized action: ${action}` })
