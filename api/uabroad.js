@@ -4,11 +4,13 @@
 // the client only ever needs to know this single URL, and never sees
 // SUPABASE_SERVICE_KEY_UABROAD or GROQ_API_KEY.
 //
-// GET /api/uabroad?action=upcoming-test
+// GET /api/uabroad?action=upcoming-test[&category=TOEFL|IELTS|SAT|ACT]
 //   -> { ok:true, test: { title, content, deadline, link } | null }
 //   Nearest upcoming test_entries row (by registration_deadline, falling
 //   back to test_date) plus a Groq-written, word-capped "detail" blurb
-//   sized for the Upcoming-tests card.
+//   sized for the Upcoming-tests card. Omit `category` for the nearest
+//   test across all four types; pass it to pin the search to just one
+//   test type. An unrecognized category returns a 400.
 //
 // POST /api/uabroad   { action:'write-test-entry', row }
 //   -> { ok:true, id }
@@ -26,7 +28,7 @@
 // adding new files — keep the DB/Groq logic itself in lib/uabroadDB.js
 // and lib/groqCall.js so it stays reusable and testable on its own.
 
-import { getUpcomingTest, insertTestEntry } from '../lib/uabroadDB.js'
+import { getUpcomingTest, insertTestEntry, listRecentTests } from '../lib/uabroadDB.js'
 import { writeCardDetail } from '../lib/groqCall.js'
 
 const DETAIL_WORD_LIMIT = 30
@@ -57,10 +59,10 @@ export default async function handler(req, res) {
 }
 
 async function handleGet(req, res) {
-  const { action } = req.query
+  const { action, category } = req.query
 
   if (action === 'upcoming-test') {
-    const row = await getUpcomingTest()
+    const row = await getUpcomingTest(category || undefined)
     if (!row) return res.status(200).json({ ok: true, test: null })
 
     const title = row.test_name || `${row.test_category} test`
@@ -82,6 +84,16 @@ async function handleGet(req, res) {
         link: row.official_link || row.source_url || null,
       },
     })
+  }
+
+  // DEBUG: https://groq-api-sand.vercel.app/api/uabroad?action=list-tests
+  // Shows the 10 most recent rows regardless of date/is_active, so you
+  // can check straight from a browser whether the table actually has
+  // data that getUpcomingTest()'s filters (is_active=true AND a future
+  // registration_deadline or test_date) should be matching.
+  if (action === 'list-tests') {
+    const tests = await listRecentTests(10)
+    return res.status(200).json({ ok: true, tests })
   }
 
   return res.status(400).json({ ok: false, error: `Unrecognized action: ${action}` })

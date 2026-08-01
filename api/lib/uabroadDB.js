@@ -48,27 +48,57 @@ async function sbSelect(url, key, path) {
 }
 
 /**
+ * Debug helper — most recent rows regardless of date/active filters, so
+ * you can check from the browser whether test_entries actually has data
+ * that getUpcomingTest()'s filters should be matching.
+ */
+export async function listRecentTests(limit = 10) {
+  const { url, key } = getConfig()
+  const columns =
+    'id,test_category,test_name,registration_deadline,test_date,is_active,created_at'
+  return sbSelect(url, key, `${TABLE}?select=${columns}&order=created_at.desc&limit=${limit}`)
+}
+
+/**
  * Nearest upcoming test — prefers the soonest registration_deadline that
  * hasn't passed; falls back to the soonest test_date if nothing has an
  * upcoming deadline. is_active rows only. Returns the raw row, or null.
+ *
+ * `category`, if given, must be one of VALID_CATEGORIES (TOEFL/IELTS/SAT/
+ * ACT) and restricts the search to just that test type instead of
+ * whichever of the four is nearest overall. An invalid category throws
+ * (400) rather than silently falling back to "all categories", so a
+ * typo'd query param doesn't quietly return the wrong test's data.
  */
-export async function getUpcomingTest() {
+export async function getUpcomingTest(category) {
   const { url, key } = getConfig()
   const today = new Date().toISOString().slice(0, 10) // YYYY-MM-DD
   const columns =
     'id,test_category,test_name,detail,registration_deadline,test_date,official_link,source_url'
 
+  let categoryFilter = ''
+  if (category !== undefined) {
+    if (!VALID_CATEGORIES.has(category)) {
+      const err = new Error(
+        `Invalid category "${category}" — must be one of ${[...VALID_CATEGORIES].join(', ')}`,
+      )
+      err.status = 400
+      throw err
+    }
+    categoryFilter = `&test_category=eq.${encodeURIComponent(category)}`
+  }
+
   let rows = await sbSelect(
     url, key,
-    `${TABLE}?select=${columns}&is_active=eq.true&registration_deadline=gte.${today}` +
-    `&order=registration_deadline.asc&limit=1`,
+    `${TABLE}?select=${columns}&is_active=eq.true${categoryFilter}` +
+    `&registration_deadline=gte.${today}&order=registration_deadline.asc&limit=1`,
   )
   if (rows.length) return rows[0]
 
   rows = await sbSelect(
     url, key,
-    `${TABLE}?select=${columns}&is_active=eq.true&test_date=gte.${today}` +
-    `&order=test_date.asc&limit=1`,
+    `${TABLE}?select=${columns}&is_active=eq.true${categoryFilter}` +
+    `&test_date=gte.${today}&order=test_date.asc&limit=1`,
   )
   return rows[0] || null
 }
