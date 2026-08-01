@@ -28,7 +28,13 @@
 // adding new files — keep the DB/Groq logic itself in lib/uabroadDB.js
 // and lib/groqCall.js so it stays reusable and testable on its own.
 
-import { getUpcomingTest, insertTestEntry, listRecentTests } from '../lib/uabroadDB.js'
+import {
+  getUpcomingTest,
+  getGeneralInfo,
+  pickGeneralInfoHighlights,
+  insertTestEntry,
+  listRecentTests,
+} from '../lib/uabroadDB.js'
 import { writeCardDetail } from '../lib/groqCall.js'
 
 const DETAIL_WORD_LIMIT = 30
@@ -58,6 +64,34 @@ export default async function handler(req, res) {
   }
 }
 
+/**
+ * Telegram-style compact link preview for the card's official/source
+ * link: site name + a short description, plus a small image on the
+ * right. There's no page-scraping step here (no extra fetch, nothing
+ * that can time out) — the image is the site's favicon (Google's public
+ * favicon endpoint, keyless) and the description is general_info's own
+ * `label` for that category, so it's exact, deterministic, and free.
+ * Returns null when there's no link to preview (nothing for the
+ * frontend to render).
+ */
+function buildLinkPreview(url, generalInfo) {
+  if (!url) return null
+
+  let siteName
+  try {
+    siteName = new URL(url).hostname.replace(/^www\./, '')
+  } catch {
+    return null // malformed official_link/source_url — skip the preview rather than throw
+  }
+
+  return {
+    url,
+    siteName,
+    image: `https://www.google.com/s2/favicons?sz=128&domain=${encodeURIComponent(siteName)}`,
+    description: generalInfo?.label || siteName,
+  }
+}
+
 async function handleGet(req, res) {
   const { action, category } = req.query
 
@@ -73,7 +107,23 @@ async function handleGet(req, res) {
       row.detail ? `Known detail: ${row.detail}` : null,
     ].filter(Boolean).join('\n')
 
-    const content = await writeCardDetail(title, context, DETAIL_WORD_LIMIT)
+    // Groq's blurb and the general-info row are independent of each
+    // other — fire them together instead of waiting on one before
+    // starting the other. A general-info lookup failure shouldn't sink
+    // the whole card (it just means no tags/link-preview description),
+    // so it's caught locally rather than propagating to the outer catch.
+    const [content, generalInfo] = await Promise.all([
+      writeCardDetail(title, context, DETAIL_WORD_LIMIT),
+      getGeneralInfo(row.test_category).catch((err) => {
+        console.error('[api/uabroad] getGeneralInfo failed', err)
+        return null
+      }),
+    ])
+
+    // Deterministic — not Groq-written — so these two facts always match
+    // exactly what's stored in test_general_info.content.
+    const tags = pickGeneralInfoHighlights(generalInfo, 2)
+    const link = row.official_link || row.source_url || null
 
     return res.status(200).json({
       ok: true,
@@ -81,7 +131,9 @@ async function handleGet(req, res) {
         title,
         content,
         deadline: row.registration_deadline || row.test_date || null,
-        link: row.official_link || row.source_url || null,
+        link,
+        tags,
+        linkPreview: buildLinkPreview(link, generalInfo),
       },
     })
   }
