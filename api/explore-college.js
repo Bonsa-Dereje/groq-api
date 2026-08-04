@@ -141,6 +141,25 @@ export default async function handler(req, res) {
   })
 
   // --- Assemble ---------------------------------------------------------
+  // --- Step: resolve the official university site (Wikidata) ----------
+  // collegeData has no website column, so this looks the school up on
+  // Wikidata (free, keyless) and pulls property P856 "official website"
+  // off whichever entity best matches the name. Falls back to a Google
+  // search link if Wikidata has nothing, so the button is never dead.
+  let websiteUrl
+  try {
+    websiteUrl = await lookupOfficialSite(row.collegeName)
+  } catch (err) {
+    console.error('[api/explore-college] Wikidata lookup error', err)
+    websiteUrl = null
+  }
+  if (websiteUrl) {
+    steps.push({ step: 'official_site', status: 'ok', detail: `Resolved via Wikidata: ${websiteUrl}` })
+  } else {
+    websiteUrl = `https://www.google.com/search?q=${encodeURIComponent(row.collegeName + ' official site')}`
+    steps.push({ step: 'official_site', status: 'fallback', detail: 'No Wikidata P856 claim found, using a Google search link instead' })
+  }
+
   const college = {
     collegeId: row.college_id,
     name: row.collegeName,
@@ -149,6 +168,7 @@ export default async function handler(req, res) {
     channelTitle: video.channelTitle,
     watchUrl: `https://www.youtube.com/watch?v=${video.videoId}`,
     embedUrl: `https://www.youtube.com/embed/${video.videoId}`,
+    websiteUrl,
   }
 
   cache = { college, expiresAt: Date.now() + CACHE_TTL_MS }
@@ -184,13 +204,19 @@ async function fetchRandomCollege(SUPABASE_URL, SUPABASE_SERVICE_KEY) {
   return rows[Math.floor(Math.random() * rows.length)]
 }
 
-// First hit for "<college name> campus tour" — type=video only,
+// Top 5 hits for "<college name> campus tour" — type=video only,
 // safeSearch on since this is embedded straight into a student dashboard.
+// search.list doesn't expose whether a video allows embedding, so this
+// pulls a handful of candidates and hands them to videos.list (below) to
+// find the first one that's actually embeddable. Without this check,
+// clicking play on a video whose owner disabled embedding renders as a
+// black <iframe> with just YouTube's own "Watch on YouTube" link — no JS
+// error, so the old single-result version had no way to catch it.
 async function searchCampusTour(collegeName, YOUTUBE_API_KEY) {
   const params = new URLSearchParams({
     part: 'snippet',
     type: 'video',
-    maxResults: '1',
+    maxResults: '5',
     safeSearch: 'strict',
     q: `${collegeName} campus tour`,
     key: YOUTUBE_API_KEY,
@@ -202,13 +228,72 @@ async function searchCampusTour(collegeName, YOUTUBE_API_KEY) {
     throw new Error(`YouTube search error: ${r.status} ${body}`)
   }
   const data = await r.json()
-  const item = data?.items?.[0]
-  const videoId = item?.id?.videoId
-  if (!videoId) return null
+  const items = data?.items || []
+  const candidates = items
+    .map((item) => ({
+      videoId: item?.id?.videoId,
+      title: item.snippet?.title || '',
+      channelTitle: item.snippet?.channelTitle || '',
+    }))
+    .filter((c) => c.videoId)
+  if (!candidates.length) return null
 
-  return {
-    videoId,
-    title: item.snippet?.title || '',
-    channelTitle: item.snippet?.channelTitle || '',
+  const embeddableId = await firstEmbeddableVideoId(candidates.map((c) => c.videoId), YOUTUBE_API_KEY)
+  if (!embeddableId) return null
+
+  return candidates.find((c) => c.videoId === embeddableId)
+}
+
+// Given a list of video IDs (in preference order), returns the first one
+// with status.embeddable === true, or null if none of them are.
+// videos.list accepts up to 50 comma-separated IDs in a single call, so
+// this is one extra API call regardless of how many candidates there are.
+async function firstEmbeddableVideoId(videoIds, YOUTUBE_API_KEY) {
+  const params = new URLSearchParams({
+    part: 'status',
+    id: videoIds.join(','),
+    key: YOUTUBE_API_KEY,
+  })
+  const r = await fetch(`https://www.googleapis.com/youtube/v3/videos?${params.toString()}`)
+  if (!r.ok) {
+    const body = await r.text().catch(() => '')
+    throw new Error(`YouTube videos.list error: ${r.status} ${body}`)
   }
+  const data = await r.json()
+  const embeddableIds = new Set(
+    (data?.items || []).filter((v) => v.status?.embeddable).map((v) => v.id)
+  )
+  return videoIds.find((id) => embeddableIds.has(id)) || null
+}
+
+// Looks the school up on Wikidata and returns its P856 "official website"
+// claim, or null if nothing matches. Two calls, both keyless/free:
+//   1. wbsearchentities — fuzzy name match -> best entity id (Q-number)
+//   2. wbgetclaims       -> P856 value off that entity, if it has one
+async function lookupOfficialSite(collegeName) {
+  const searchParams = new URLSearchParams({
+    action: 'wbsearchentities',
+    search: collegeName,
+    language: 'en',
+    format: 'json',
+    type: 'item',
+    limit: '1',
+  })
+  const searchRes = await fetch(`https://www.wikidata.org/w/api.php?${searchParams.toString()}`)
+  if (!searchRes.ok) return null
+  const searchData = await searchRes.json()
+  const entityId = searchData?.search?.[0]?.id
+  if (!entityId) return null
+
+  const claimsParams = new URLSearchParams({
+    action: 'wbgetclaims',
+    entity: entityId,
+    property: 'P856',
+    format: 'json',
+  })
+  const claimsRes = await fetch(`https://www.wikidata.org/w/api.php?${claimsParams.toString()}`)
+  if (!claimsRes.ok) return null
+  const claimsData = await claimsRes.json()
+  const url = claimsData?.claims?.P856?.[0]?.mainsnak?.datavalue?.value
+  return url || null
 }
