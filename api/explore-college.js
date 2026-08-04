@@ -156,8 +156,7 @@ export default async function handler(req, res) {
   if (websiteUrl) {
     steps.push({ step: 'official_site', status: 'ok', detail: `Resolved via Wikidata: ${websiteUrl}` })
   } else {
-    websiteUrl = `https://www.google.com/search?q=${encodeURIComponent(row.collegeName + ' official site')}`
-    steps.push({ step: 'official_site', status: 'fallback', detail: 'No Wikidata P856 claim found, using a Google search link instead' })
+    steps.push({ step: 'official_site', status: 'empty', detail: 'No Wikidata P856 claim found for this college — frontend hides the "Go to site" button' })
   }
 
   const college = {
