@@ -3,8 +3,12 @@
 // in alongside the Upcoming-tests card.
 //
 //   SUPABASE_URL_UABROAD / SUPABASE_SERVICE_KEY_UABROAD  -> same pair as
-//     the rest of the project, read-only here (only ever SELECTs from
-//     public."collegeData").
+//     the rest of the project. Used for two things here:
+//       1. SELECT-only against public."collegeData"
+//       2. Storage REST calls (list + public URL) against the
+//          "college_images" bucket. The bucket is public (see the RLS
+//          policy below) so the URLs this returns are plain, cacheable
+//          GETs — no signing round-trip needed.
 //   YOUTUBE_API_KEY                                      -> Google Cloud
 //     Console -> enable "YouTube Data API v3" on a project -> Credentials
 //     -> "Create credentials" -> API key. No OAuth needed, this only
@@ -22,24 +26,47 @@
 // which video to embed via search.list. There's no separate "download
 // the thumbnail" step to build.
 //
+// NOTE on the college image: this DOES point at a real object in
+// Storage, not a facade — the "college_images" bucket is laid out as
+//   college_images/<college_id>/building/*
+//   college_images/<college_id>/scenery/*
+//   college_images/<college_id>/classroom/*
+//   college_images/<college_id>/other/*
+// and pickCollegeImage() below walks those four folders in that exact
+// order, stopping at the first one that has files, then picks randomly
+// within it. Not every college has every folder (or any folder), so a
+// null image is a normal, expected outcome — the frontend should just
+// hide the image slot in that case, same pattern as websiteUrl already
+// being nullable.
+//
 // GET /api/explore-college
 //   1. Grabs one random row from "collegeData" (is nothing more than an
 //      id + name lookup — collegeData has no is_active flag, so every row
 //      is fair game).
 //   2. Searches YouTube for "<collegeName> campus tour", takes the first
-//      hit.
-//   3. Returns { ok:true, college: { collegeId, name, videoId, videoTitle,
-//      channelTitle, watchUrl, embedUrl } } or { ok:true, college:null }
-//      if the table's empty / nothing comes back from YouTube.
-//   4. Also fetches a random image from the college's storage folder,
-//      trying building -> scenery -> classroom -> other in order.
+//      embeddable hit.
+//   3. Walks college_images/<college_id>/{building,scenery,classroom,other}
+//      in priority order and picks one random file from the first
+//      non-empty folder.
+//   4. Returns { ok:true, college: { collegeId, name, videoId, videoTitle,
+//      channelTitle, watchUrl, embedUrl, websiteUrl, image } } or
+//      { ok:true, college:null } if the table's empty / nothing comes
+//      back from YouTube. `image` is null if none of the four folders
+//      had anything in them.
 //
 // Cheap in-memory cache (module scope) so a burst of flips on a warm
-// lambda doesn't re-spend YouTube quota every time — each search.list
-// call costs 100 quota units against a 10,000/day default. This is NOT a
-// durable cache (cold starts wipe it), just a courtesy dedupe.
+// lambda doesn't re-spend YouTube quota / Storage calls every time —
+// each YouTube search.list call costs 100 quota units against a
+// 10,000/day default. This is NOT a durable cache (cold starts wipe it),
+// just a courtesy dedupe.
 let cache = { college: null, expiresAt: 0 }
 const CACHE_TTL_MS = 45_000
+
+// Priority order for the image folders inside each college's directory.
+// First folder that actually has files in it wins; if a college has no
+// "building" folder at all (or it's empty), we fall through to the next.
+const IMAGE_FOLDER_PRIORITY = ['building', 'scenery', 'classroom', 'other']
+const IMAGES_BUCKET = 'college_images'
 
 export default async function handler(req, res) {
   // CORS: this app is fetched cross-origin (frontend lives on a different
@@ -95,7 +122,7 @@ export default async function handler(req, res) {
 
   const fresh = req.query?.fresh === '1'
   if (!fresh && cache.college && Date.now() < cache.expiresAt) {
-    steps.push({ step: 'cache', status: 'ok', detail: 'Served from warm-lambda cache, skipped Supabase + YouTube' })
+    steps.push({ step: 'cache', status: 'ok', detail: 'Served from warm-lambda cache, skipped Supabase + YouTube + Storage' })
     return res.status(200).json({ ok: true, college: cache.college, steps })
   }
   steps.push({ step: 'cache', status: 'miss', detail: fresh ? 'Bypassed with ?fresh=1' : 'No warm cache entry (cold start or expired)' })
@@ -142,21 +169,6 @@ export default async function handler(req, res) {
     detail: `videoId=${video.videoId} — "${video.title}" (${video.channelTitle})`,
   })
 
-  // --- Step: fetch a random image from storage -------------------------
-  let imageUrl = null
-  try {
-    imageUrl = await fetchRandomCollegeImage(row.college_id, SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    if (imageUrl) {
-      steps.push({ step: 'fetch_image', status: 'ok', detail: `Found image in storage: ${imageUrl}` })
-    } else {
-      steps.push({ step: 'fetch_image', status: 'empty', detail: `No images found for college_id ${row.college_id} in any folder (building, scenery, classroom, other)` })
-    }
-  } catch (err) {
-    console.error('[api/explore-college] Storage error', err)
-    steps.push({ step: 'fetch_image', status: 'error', detail: err.message })
-    imageUrl = null
-  }
-
   // --- Step: resolve the official university site (Wikidata) ----------
   // collegeData has no website column, so this looks the school up on
   // Wikidata (free, keyless) and pulls property P856 "official website"
@@ -175,6 +187,26 @@ export default async function handler(req, res) {
     steps.push({ step: 'official_site', status: 'empty', detail: 'No Wikidata P856 claim found for this college — frontend hides the "Go to site" button' })
   }
 
+  // --- Step: pick a random image from Storage --------------------------
+  // Walks building -> scenery -> classroom -> other under
+  // college_images/<college_id>/, stops at the first folder that has
+  // files, picks one at random. Null image (not an error) if the
+  // college has no images at all yet.
+  let image
+  try {
+    image = await pickCollegeImage(row.college_id, SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  } catch (err) {
+    console.error('[api/explore-college] Storage image lookup error', err)
+    steps.push({ step: 'fetch_image', status: 'error', detail: err.message })
+    image = null
+  }
+  if (image) {
+    steps.push({ step: 'fetch_image', status: 'ok', detail: `Picked "${image.path}" from "${image.folder}" folder` })
+  } else if (!steps.some((s) => s.step === 'fetch_image')) {
+    steps.push({ step: 'fetch_image', status: 'empty', detail: `No files found in any of ${IMAGE_FOLDER_PRIORITY.join(', ')} for college_id ${row.college_id}` })
+  }
+
+  // --- Assemble ---------------------------------------------------------
   const college = {
     collegeId: row.college_id,
     name: row.collegeName,
@@ -184,7 +216,7 @@ export default async function handler(req, res) {
     watchUrl: `https://www.youtube.com/watch?v=${video.videoId}`,
     embedUrl: `https://www.youtube.com/embed/${video.videoId}`,
     websiteUrl,
-    imageUrl, // Add the image URL to the response
+    image, // { folder, path, url } or null — expand button not wired up yet, just display image + name
   }
 
   cache = { college, expiresAt: Date.now() + CACHE_TTL_MS }
@@ -218,55 +250,6 @@ async function fetchRandomCollege(SUPABASE_URL, SUPABASE_SERVICE_KEY) {
   if (!rows.length) return null
 
   return rows[Math.floor(Math.random() * rows.length)]
-}
-
-// Fetches a random image from the college's storage folder, trying
-// building -> scenery -> classroom -> other in order.
-async function fetchRandomCollegeImage(collegeId, SUPABASE_URL, SUPABASE_SERVICE_KEY) {
-  const sbHeaders = {
-    apikey: SUPABASE_SERVICE_KEY,
-    Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
-  }
-
-  // Folder priority order
-  const folderOrder = ['building', 'scenery', 'classroom', 'other']
-  
-  for (const folder of folderOrder) {
-    const folderPath = `college_images/${collegeId}/${folder}/`
-    
-    try {
-      // List all files in this folder
-      const listUrl = `${SUPABASE_URL}/storage/v1/object/list/college_images?prefix=${encodeURIComponent(folderPath)}`
-      
-      const r = await fetch(listUrl, { headers: sbHeaders })
-      if (!r.ok) {
-        console.log(`Folder ${folder} not accessible: ${r.status}`)
-        continue
-      }
-      
-      const files = await r.json()
-      
-      // Filter out the folder itself (empty path) and keep only actual files
-      const imageFiles = files.filter(f => 
-        f.name && f.name !== '' && !f.name.endsWith('/')
-      )
-      
-      if (imageFiles.length > 0) {
-        // Pick a random file from this folder
-        const randomFile = imageFiles[Math.floor(Math.random() * imageFiles.length)]
-        const imagePath = `${folderPath}${randomFile.name}`
-        
-        // Generate a public URL for the image
-        const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/college_images/${encodeURIComponent(imagePath)}`
-        return publicUrl
-      }
-    } catch (err) {
-      console.log(`Error reading folder ${folder}:`, err.message)
-      continue
-    }
-  }
-  
-  return null // No images found in any folder
 }
 
 // Top 5 hits for "<college name> campus tour" — type=video only,
@@ -361,4 +344,62 @@ async function lookupOfficialSite(collegeName) {
   const claimsData = await claimsRes.json()
   const url = claimsData?.claims?.P856?.[0]?.mainsnak?.datavalue?.value
   return url || null
+}
+
+// Walks college_images/<college_id>/{building,scenery,classroom,other}
+// in that exact priority order via Storage's list endpoint, stops at the
+// first folder that actually has files in it, and returns one random
+// pick from that folder. Returns null if none of the four folders exist
+// or all are empty for this college.
+async function pickCollegeImage(collegeId, SUPABASE_URL, SUPABASE_SERVICE_KEY) {
+  const sbHeaders = {
+    apikey: SUPABASE_SERVICE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+    'Content-Type': 'application/json',
+  }
+
+  for (const folder of IMAGE_FOLDER_PRIORITY) {
+    const prefix = `${collegeId}/${folder}`
+
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/list/${IMAGES_BUCKET}`, {
+      method: 'POST',
+      headers: sbHeaders,
+      body: JSON.stringify({
+        prefix,
+        limit: 100,
+        offset: 0,
+        sortBy: { column: 'name', order: 'asc' },
+      }),
+    })
+
+    // A missing prefix isn't an error from this endpoint (it just comes
+    // back as an empty array), but treat a genuine HTTP failure here as
+    // "this folder doesn't count" rather than aborting the whole
+    // fallback chain — one bad folder shouldn't sink the other three.
+    if (!r.ok) continue
+
+    const entries = await r.json()
+    // Supabase Storage's list endpoint returns folders AND files as
+    // sibling entries; real files have an `id` (uuid) and metadata,
+    // sub-folders don't. Also strip out the placeholder object some
+    // Supabase UIs leave behind when a folder is created empty.
+    const files = (entries || []).filter(
+      (e) => e && e.id && e.name && e.name !== '.emptyFolderPlaceholder'
+    )
+    if (!files.length) continue
+
+    const pick = files[Math.floor(Math.random() * files.length)]
+    const path = `${prefix}/${pick.name}`
+
+    return {
+      folder,
+      path,
+      // Bucket is public (see the storage.objects SELECT policy for
+      // "college_images"), so this is a plain, cacheable, keyless URL —
+      // no signing round-trip needed.
+      url: `${SUPABASE_URL}/storage/v1/object/public/${IMAGES_BUCKET}/${path}`,
+    }
+  }
+
+  return null
 }
