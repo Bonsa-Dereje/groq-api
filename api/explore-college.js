@@ -31,6 +31,8 @@
 //   3. Returns { ok:true, college: { collegeId, name, videoId, videoTitle,
 //      channelTitle, watchUrl, embedUrl } } or { ok:true, college:null }
 //      if the table's empty / nothing comes back from YouTube.
+//   4. Also fetches a random image from the college's storage folder,
+//      trying building -> scenery -> classroom -> other in order.
 //
 // Cheap in-memory cache (module scope) so a burst of flips on a warm
 // lambda doesn't re-spend YouTube quota every time — each search.list
@@ -140,7 +142,21 @@ export default async function handler(req, res) {
     detail: `videoId=${video.videoId} — "${video.title}" (${video.channelTitle})`,
   })
 
-  // --- Assemble ---------------------------------------------------------
+  // --- Step: fetch a random image from storage -------------------------
+  let imageUrl = null
+  try {
+    imageUrl = await fetchRandomCollegeImage(row.college_id, SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    if (imageUrl) {
+      steps.push({ step: 'fetch_image', status: 'ok', detail: `Found image in storage: ${imageUrl}` })
+    } else {
+      steps.push({ step: 'fetch_image', status: 'empty', detail: `No images found for college_id ${row.college_id} in any folder (building, scenery, classroom, other)` })
+    }
+  } catch (err) {
+    console.error('[api/explore-college] Storage error', err)
+    steps.push({ step: 'fetch_image', status: 'error', detail: err.message })
+    imageUrl = null
+  }
+
   // --- Step: resolve the official university site (Wikidata) ----------
   // collegeData has no website column, so this looks the school up on
   // Wikidata (free, keyless) and pulls property P856 "official website"
@@ -168,10 +184,11 @@ export default async function handler(req, res) {
     watchUrl: `https://www.youtube.com/watch?v=${video.videoId}`,
     embedUrl: `https://www.youtube.com/embed/${video.videoId}`,
     websiteUrl,
+    imageUrl, // Add the image URL to the response
   }
 
   cache = { college, expiresAt: Date.now() + CACHE_TTL_MS }
-  steps.push({ step: 'done', status: 'ok', detail: 'College + video assembled and cached' })
+  steps.push({ step: 'done', status: 'ok', detail: 'College + video + image assembled and cached' })
 
   return res.status(200).json({ ok: true, college, steps })
 }
@@ -201,6 +218,55 @@ async function fetchRandomCollege(SUPABASE_URL, SUPABASE_SERVICE_KEY) {
   if (!rows.length) return null
 
   return rows[Math.floor(Math.random() * rows.length)]
+}
+
+// Fetches a random image from the college's storage folder, trying
+// building -> scenery -> classroom -> other in order.
+async function fetchRandomCollegeImage(collegeId, SUPABASE_URL, SUPABASE_SERVICE_KEY) {
+  const sbHeaders = {
+    apikey: SUPABASE_SERVICE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+  }
+
+  // Folder priority order
+  const folderOrder = ['building', 'scenery', 'classroom', 'other']
+  
+  for (const folder of folderOrder) {
+    const folderPath = `college_images/${collegeId}/${folder}/`
+    
+    try {
+      // List all files in this folder
+      const listUrl = `${SUPABASE_URL}/storage/v1/object/list/college_images?prefix=${encodeURIComponent(folderPath)}`
+      
+      const r = await fetch(listUrl, { headers: sbHeaders })
+      if (!r.ok) {
+        console.log(`Folder ${folder} not accessible: ${r.status}`)
+        continue
+      }
+      
+      const files = await r.json()
+      
+      // Filter out the folder itself (empty path) and keep only actual files
+      const imageFiles = files.filter(f => 
+        f.name && f.name !== '' && !f.name.endsWith('/')
+      )
+      
+      if (imageFiles.length > 0) {
+        // Pick a random file from this folder
+        const randomFile = imageFiles[Math.floor(Math.random() * imageFiles.length)]
+        const imagePath = `${folderPath}${randomFile.name}`
+        
+        // Generate a public URL for the image
+        const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/college_images/${encodeURIComponent(imagePath)}`
+        return publicUrl
+      }
+    } catch (err) {
+      console.log(`Error reading folder ${folder}:`, err.message)
+      continue
+    }
+  }
+  
+  return null // No images found in any folder
 }
 
 // Top 5 hits for "<college name> campus tour" — type=video only,
