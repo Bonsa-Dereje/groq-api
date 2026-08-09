@@ -12,15 +12,17 @@
 // given; callers that already know the next id can pass it explicitly to
 // skip that lookup.
 //
-// Env vars required (set these in the Vercel project, not in the caller):
+// Env vars required (set these in the Vercel project):
 //   SUPABASE_URL_UABROAD
 //   SUPABASE_SERVICE_KEY_UABROAD
 //   YOUTUBE_API_KEY
-//   INGEST_SHARED_SECRET   <- new: callers must present this
+//
+// NOTE: the shared-secret check has been removed for now while testing
+// locally. Anyone with the URL can call this and burn YouTube quota /
+// write to explore_colleges — add auth back before this is public-facing.
 //
 // Request:
 //   GET /api/explore-college-ingest
-//     Authorization: Bearer <INGEST_SHARED_SECRET>   (or ?secret=... query param)
 //     ?start_id=123     optional — else auto-resumes from MAX(college_id)+1
 //     &dry_run=1        optional — search only, skip the upsert
 //
@@ -28,12 +30,11 @@
 //   { done: false, college_id, collegeName, youtube_link, dry_run }
 //   { done: true }                                  <- no rows at/after start_id
 //
-// Errors: 401 (bad/missing secret), 500 (missing env / upstream failure)
+// Errors: 500 (missing env / upstream failure)
 
 const SUPABASE_URL = process.env.SUPABASE_URL_UABROAD;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY_UABROAD;
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const INGEST_SHARED_SECRET = process.env.INGEST_SHARED_SECRET;
 
 const TABLE_SOURCE = 'collegeData';
 const TABLE_TARGET = 'explore_colleges';
@@ -122,21 +123,9 @@ async function upsertResult(collegeId, youtubeLink) {
   if (!r.ok) throw new Error(`Supabase upsert failed: ${r.status} ${await r.text()}`);
 }
 
-function checkSecret(req) {
-  const header = req.headers.authorization || '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7) : null;
-  const provided = bearer || req.query.secret;
-  return Boolean(INGEST_SHARED_SECRET) && provided === INGEST_SHARED_SECRET;
-}
-
 module.exports = async (req, res) => {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !YOUTUBE_API_KEY || !INGEST_SHARED_SECRET) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !YOUTUBE_API_KEY) {
     res.status(500).json({ error: 'Server missing required env vars.' });
-    return;
-  }
-
-  if (!checkSecret(req)) {
-    res.status(401).json({ error: 'Missing or invalid secret.' });
     return;
   }
 

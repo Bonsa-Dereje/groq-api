@@ -14,9 +14,9 @@ explore_colleges. Every call after that passes start_id explicitly
 (previous college_id + 1) since the script already knows it — no need to
 ask the endpoint to look it up again each time.
 
-Env vars required:
-  INGEST_ENDPOINT_URL     e.g. https://groq-api-sand.vercel.app/api/explore-college-ingest
-  INGEST_SHARED_SECRET    shared secret, must match the endpoint's env var
+NOTE: the shared-secret check has been removed on the endpoint side for
+now while testing locally, so this script no longer sends one either.
+Add it back on both sides before this is public-facing.
 
 Usage:
   python explore_college_ingest.py                 # normal daily run, auto-resumes
@@ -26,7 +26,6 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 import time
 
@@ -35,21 +34,9 @@ import requests
 DAILY_LIMIT_DEFAULT = 100
 REQUEST_DELAY_SECONDS = 1.0  # be polite between calls to the endpoint
 
-INGEST_ENDPOINT_URL = os.environ.get("INGEST_ENDPOINT_URL")
-INGEST_SHARED_SECRET = os.environ.get("INGEST_SHARED_SECRET")
-
-
-def require_env():
-    missing = [
-        name
-        for name, val in [
-            ("INGEST_ENDPOINT_URL", INGEST_ENDPOINT_URL),
-            ("INGEST_SHARED_SECRET", INGEST_SHARED_SECRET),
-        ]
-        if not val
-    ]
-    if missing:
-        sys.exit(f"Missing required env vars: {', '.join(missing)}")
+# Same Vercel project _page.svelte's UABROAD_API_BASE points at.
+UABROAD_API_BASE = "https://groq-api-sand.vercel.app"
+INGEST_ENDPOINT_URL = f"{UABROAD_API_BASE}/api/explore-college-ingest"
 
 
 def call_ingest_endpoint(start_id=None, dry_run=False):
@@ -61,12 +48,9 @@ def call_ingest_endpoint(start_id=None, dry_run=False):
     if dry_run:
         params["dry_run"] = "1"
 
-    r = requests.get(
-        INGEST_ENDPOINT_URL,
-        params=params,
-        headers={"Authorization": f"Bearer {INGEST_SHARED_SECRET}"},
-        timeout=30,
-    )
+    r = requests.get(INGEST_ENDPOINT_URL, params=params, timeout=30)
+    if not r.ok:
+        print(f"  Response body: {r.text}")
     r.raise_for_status()
     return r.json()
 
@@ -94,14 +78,13 @@ def main():
     )
     args = parser.parse_args()
 
-    require_env()
-
     # None on the first call => endpoint auto-resumes from MAX(college_id)+1.
     # After that we always pass it explicitly since we already know it.
     next_start_id = args.start_id
     processed = 0
 
     print(f"Calling {INGEST_ENDPOINT_URL} for up to {args.limit} colleges...")
+
 
     for _ in range(args.limit):
         try:
